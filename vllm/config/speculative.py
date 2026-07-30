@@ -899,12 +899,62 @@ class SpeculativeConfig:
                 if self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
-                    # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
-                    ]
+                    # Determine if this is a Qwen3-based or DeepSeek-V4-based DSpark.
+                    # Qwen3-based DSparkDraftModel checkpoints have transformer_layer_config
+                    # with model_type="qwen3". Route them to Qwen3DSparkModel (which maps
+                    # to Qwen3DSparkForCausalLM). DeepSeek-V4 based ones use DSparkDraftModel
+                    # (which maps to DSparkDeepseekV4ForCausalLM). Routing Qwen3 weights to
+                    # the DeepSeek V4 model class causes an architecture mismatch -> collapse.
+                    tlc = getattr(
+                        self.draft_model_config.hf_config,
+                        "transformer_layer_config", None,
+                    )
+                    backbone_type = None
+                    if isinstance(tlc, dict):
+                        backbone_type = tlc.get("model_type")
+                    elif tlc is not None:
+                        backbone_type = getattr(tlc, "model_type", None)
+                    if backbone_type == "qwen3":
+                        self.draft_model_config.hf_config.architectures = [
+                            "Qwen3DSparkModel"
+                        ]
+                    else:
+                        # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
+                        # and its weights ship in the target checkpoint.
+                        self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DSparkDraftModel"
+                        ]
+                    # Flatten transformer_layer_config to top level: vllm model classes
+                    # (DFlashQwen3Model etc.) read hidden_size, num_hidden_layers etc. from
+                    # the top-level config, but SpeculatorsConfig (pydantic) nests them in
+                    # transformer_layer_config. Without flattening, the model is created
+                    # with wrong/missing dimensions -> wrong base logits -> acceptance collapse.
+                    # Pydantic models ignore setattr on non-fields, so we replace the config
+                    # entirely with a plain PretrainedConfig (flattened).
+                    _hf = self.draft_model_config.hf_config
+                    if hasattr(_hf, "transformer_layer_config"):
+                        from transformers import PretrainedConfig
+                        if hasattr(_hf, "model_dump"):
+                            _flat = _hf.model_dump()
+                        elif hasattr(_hf, "to_dict"):
+                            _flat = _hf.to_dict()
+                        else:
+                            _flat = dict(_hf.__dict__)
+                        _tlc = _flat.pop("transformer_layer_config", {})
+                        if isinstance(_tlc, dict):
+                            _flat.update({k: v for k, v in _tlc.items() if k not in _flat or _flat[k] is None})
+                        elif hasattr(_tlc, "to_dict"):
+                            _tlc_dict = _tlc.to_dict()
+                            _flat.update({k: v for k, v in _tlc_dict.items() if k not in _flat or _flat[k] is None})
+                        elif hasattr(_tlc, "model_dump"):
+                            _tlc_dict = _tlc.model_dump()
+                            _flat.update({k: v for k, v in _tlc_dict.items() if k not in _flat or _flat[k] is None})
+                        # Remove speculators-only fields that confuse vllm
+                        for _sk in ["speculators_config", "speculators_model_type",
+                                     "speculators_version", "auto_map"]:
+                            _flat.pop(_sk, None)
+                        self.draft_model_config.hf_config = PretrainedConfig(**_flat)
                     self.update_arch_()
 
                 if self.method in ("dflash", "dspark"):

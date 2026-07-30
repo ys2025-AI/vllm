@@ -15,6 +15,7 @@ DSparkMarkovHead is shared with the DSV4-style DSpark model.
 """
 
 from collections.abc import Iterable
+import os
 
 import torch
 import torch.nn as nn
@@ -126,12 +127,39 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         else:
             self.draft_id_to_target_id = None
 
+        # Draft adapter (zero-init last layer, starts as identity == DFlash).
+        # Learns to realign draft logits for a different sfa convention.
+        # HACK: config loses draft_adapter_rank (loaded as base SpeculatorsConfig,
+        # not DSparkSpeculatorConfig). Hardcode to 256 to match the trained checkpoint.
+        # For checkpoints without adapter weights, the zero-init last layer = identity (harmless).
+        adapter_rank = getattr(self.config, "draft_adapter_rank", 0)
+        if not adapter_rank and hasattr(self.config, "model_dump"):
+            try:
+                raw = self.config.model_dump()
+                adapter_rank = raw.get("draft_adapter_rank", 0) or 0
+            except Exception:
+                pass
+        if not adapter_rank:
+            adapter_rank = 256  # fallback: assume the checkpoint has a rank-256 adapter
+        logger.info("draft_adapter_rank from config: %s (config type: %s, using: %s)", getattr(self.config, "draft_adapter_rank", "N/A"), type(self.config).__name__, adapter_rank)
+        if adapter_rank and adapter_rank > 0:
+            self.draft_adapter = nn.Sequential(
+                nn.Linear(self.config.hidden_size, adapter_rank, bias=False),
+                nn.GELU(),
+                nn.Linear(adapter_rank, self.config.hidden_size, bias=False),
+            )
+            nn.init.zeros_(self.draft_adapter[-1].weight)
+        else:
+            self.draft_adapter = None
+
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Draft-vocab logits without the d2t scatter: the speculator adds the
         # Markov bias in draft space, then remaps via map_draft_to_target.
+        if self.draft_adapter is not None and os.environ.get("DSPARK_DISABLE_ADAPTER", "0") != "1":
+            hidden_states = hidden_states + self.draft_adapter(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -141,7 +169,13 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         return draft_ids + self.draft_id_to_target_id[draft_ids]
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        emb = self.model.markov_head.embed(token_ids)
+        # EXPERIMENT PATCH: zero the Markov embedding -> Markov bias becomes 0
+        # (equivalent to markov_rank=0: no transition bias added to base logits).
+        # Gated by env var so the normal DSpark path is unaffected.
+        if os.environ.get("DSPARK_DISABLE_MARKOV", "0") == "1":
+            return torch.zeros_like(emb)
+        return emb
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
@@ -158,7 +192,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
-            elif "lm_head" not in name:
+            elif "lm_head" not in name and "draft_adapter" not in name:
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
