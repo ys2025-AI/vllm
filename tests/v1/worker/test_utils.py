@@ -3,7 +3,12 @@
 
 import torch
 
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.worker.utils import (
+    _kv_cache_block_major_bytes,
+    bind_kv_cache,
+    copy_kv_cache_blocks_inplace,
+)
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -90,3 +95,92 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def _block_major_bytes(tensor: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    return _kv_cache_block_major_bytes(tensor, num_blocks).view(num_blocks, -1)
+
+
+def _assert_copy(
+    probe: torch.Tensor,
+    kv_caches: list,
+    num_blocks: int,
+    src_block: int,
+    dst_block: int,
+    expected: torch.Tensor,
+) -> None:
+    copy_kv_cache_blocks_inplace(
+        kv_caches, num_blocks, [KVCacheBlockCopy(src_block, dst_block)]
+    )
+    after = _block_major_bytes(probe, num_blocks)
+    assert torch.equal(after[dst_block], expected[src_block])
+    for block in range(num_blocks):
+        if block != dst_block:
+            assert torch.equal(after[block], expected[block])
+
+
+def test_copy_kv_cache_blocks_aligned_over_allocation():
+    """Regression test: the platform allocator may over-allocate a KV cache
+    tensor to align ``data_ptr`` (e.g. vllm-ascend allocates ``size + 2MiB``).
+    The copy must operate on the tensor's own block-major region instead of the
+    whole storage, otherwise the block count no longer divides the storage
+    size and the copy assertion fails."""
+    num_blocks, page_bytes, alignment = 7, 16, 8
+    per_layer = num_blocks * page_bytes
+    # alignment chosen so that (num_blocks * page_bytes + alignment) is not a
+    # multiple of num_blocks.
+    raw = torch.zeros(per_layer + alignment, dtype=torch.uint8)
+    raw[alignment : alignment + per_layer] = torch.arange(per_layer, dtype=torch.uint8)
+    # bf16 view with a nonzero storage offset, as produced by vllm-ascend.
+    tensor = (
+        raw[alignment : alignment + per_layer]
+        .view(torch.bfloat16)
+        .view(num_blocks, page_bytes // 2)
+    )
+    assert raw.untyped_storage().nbytes() % num_blocks != 0
+
+    expected = raw[alignment : alignment + per_layer].view(num_blocks, page_bytes)
+    assert torch.equal(_block_major_bytes(tensor, num_blocks), expected)
+    _assert_copy(tensor, [tensor], num_blocks, 2, 5, expected)
+
+
+def test_copy_kv_cache_blocks_page_padded_strided():
+    """Block copy must follow the padded page stride of a strided cache view."""
+    num_blocks, inner_bytes, padded_page = 6, 12, 16
+    raw = torch.arange(num_blocks * padded_page, dtype=torch.uint8)
+    tensor = torch.as_strided(
+        raw, size=(num_blocks, inner_bytes), stride=(padded_page, 1)
+    )
+    assert not tensor.is_contiguous()
+
+    expected = raw.view(num_blocks, padded_page)
+    assert torch.equal(_block_major_bytes(tensor, num_blocks), expected)
+    _assert_copy(tensor, [tensor], num_blocks, 1, 4, expected)
+
+
+def test_copy_kv_cache_blocks_virtual_split():
+    """Dense caches may expose several kernel blocks per logical block."""
+    num_blocks, ratio, inner_bytes = 5, 3, 8
+    raw = torch.arange(num_blocks * ratio * inner_bytes, dtype=torch.uint8)
+    tensor = raw.view(num_blocks * ratio, inner_bytes)
+
+    expected = raw.view(num_blocks, ratio * inner_bytes)
+    assert torch.equal(_block_major_bytes(tensor, num_blocks), expected)
+    _assert_copy(tensor, [tensor], num_blocks, 0, 3, expected)
+
+
+def test_copy_kv_cache_blocks_skips_duplicate_and_empty_entries():
+    """Duplicate views of the same data pointer are copied once; empty and
+    non-tensor entries are ignored."""
+    num_blocks, page_bytes = 4, 8
+    tensor = torch.arange(num_blocks * page_bytes, dtype=torch.uint8)
+    other = torch.zeros(0, dtype=torch.uint8)
+    expected = tensor.view(num_blocks, page_bytes).clone()
+    _assert_copy(
+        tensor,
+        [(tensor, tensor), other, None, (tensor, tensor)],
+        num_blocks,
+        1,
+        2,
+        expected,
+    )

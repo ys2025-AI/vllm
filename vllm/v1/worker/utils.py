@@ -550,6 +550,67 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+def _kv_cache_block_major_bytes(tensor: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    """Return a flat uint8 view of a KV cache tensor's block-major bytes.
+
+    ``tensor`` may be a strided view (padded pages, packed layers, K/V split)
+    whose backing storage is larger than the region it actually owns, e.g. the
+    platform allocator over-allocates to align ``data_ptr``.  The view returned
+    here starts at the tensor's storage offset and spans exactly ``num_blocks``
+    physical pages, so block ``i`` always maps to the byte range
+    ``[i * block_stride, (i + 1) * block_stride)`` regardless of any padding
+    that surrounds the tensor in its storage.
+    """
+    if num_blocks <= 0:
+        raise ValueError(f"num_blocks must be positive, got {num_blocks}")
+
+    element_size = tensor.element_size()
+    offset_bytes = tensor.storage_offset() * element_size
+    storage = tensor.untyped_storage()
+    available_bytes = storage.nbytes() - offset_bytes
+
+    # Locate the dimension that indexes logical blocks: it has length
+    # ``num_blocks`` and its stride is the byte distance between two blocks.
+    block_stride_bytes: int | None = None
+    for dim, size in enumerate(tensor.shape):
+        if size != num_blocks:
+            continue
+        stride_bytes = tensor.stride(dim) * element_size
+        if stride_bytes > 0 and num_blocks * stride_bytes <= available_bytes:
+            block_stride_bytes = stride_bytes
+            break
+
+    if block_stride_bytes is None:
+        # Dense layout (optionally with virtual block splitting, i.e. the
+        # tensor holds more kernel blocks than logical ones). Only contiguous
+        # tensors can be split evenly by ``num_blocks``.
+        total_bytes = tensor.numel() * element_size
+        if (
+            tensor.is_contiguous()
+            and total_bytes % num_blocks == 0
+            and total_bytes <= available_bytes
+        ):
+            block_stride_bytes = total_bytes // num_blocks
+        elif offset_bytes == 0 and storage.nbytes() % num_blocks == 0:
+            # Legacy path: the whole storage is a clean block-major buffer with
+            # no alignment prefix.
+            blocks = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+            blocks.set_(storage)
+            return blocks
+        else:
+            raise AssertionError(
+                "Cannot determine the block-major layout of a KV cache tensor: "
+                f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}, "
+                f"num_blocks={num_blocks}, storage_bytes={storage.nbytes()}, "
+                f"storage_offset_bytes={offset_bytes}."
+            )
+
+    span_bytes = num_blocks * block_stride_bytes
+    blocks = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+    blocks.set_(storage, offset_bytes, (span_bytes,))
+    return blocks
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
@@ -559,16 +620,18 @@ def copy_kv_cache_blocks_inplace(
         return
 
     storage_tensors: list[torch.Tensor] = []
-    seen_storage: set[int] = set()
+    seen_ptrs: set[int] = set()
     for entry in kv_caches:
         # Mamba layers hold a list of state tensors; attention layers a single
         # tensor. Both alias the shared block-major backing storage.
         tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
         for tensor in tensors:
-            ptr = tensor.untyped_storage().data_ptr()
-            if ptr in seen_storage:
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
                 continue
-            seen_storage.add(ptr)
+            ptr = tensor.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
             storage_tensors.append(tensor)
 
     if not storage_tensors:
@@ -580,12 +643,10 @@ def copy_kv_cache_blocks_inplace(
 
     for tensor in storage_tensors:
         assert tensor.device == device
-        blocks = torch.empty(0, dtype=torch.uint8, device=device)
-        blocks.set_(tensor.untyped_storage())
-        # Block-major backing storage: block i owns the contiguous byte range
-        # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
+        # Block-major backing storage: block i owns the byte range
+        # [i * block_stride, (i + 1) * block_stride) within this tensor's own
+        # region of the storage (which may be over-allocated for alignment).
+        blocks = _kv_cache_block_major_bytes(tensor, num_blocks).view(num_blocks, -1)
         blocks[dst_indices] = blocks[src_indices]
 
 
