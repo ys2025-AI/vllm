@@ -535,9 +535,6 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             # build_connector_meta never recorded a filename for it. There are
             # no hidden states to save and no blocks worth delaying.
             self._pending_saves.pop(req_id, None)
-            lock_fd = self._lock_fds.pop(req_id, None)
-            if lock_fd is not None:
-                os.close(lock_fd)
             return False, None
         kv_params = request.kv_transfer_params or {}
         if kv_params.get("include_output_tokens", False):
@@ -591,10 +588,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 continue  # DtoH copy still in flight
             self._req_copy_events.pop(req_id, None)
             self._accumulated_finished_req_ids.discard(req_id)
-            # Only report requests we actually tracked for sending. A request
-            # aborted before it was ever scheduled never had a copy submitted
-            # and was already freed by the scheduler; reporting it here would
-            # trip `assert req_id in self.requests` in the scheduler.
+            # Only report requests we actually tracked for sending.
             if event is not None:
                 done_sending.add(req_id)
             # Clean up any leftover lock fds (e.g. aborted requests that never
